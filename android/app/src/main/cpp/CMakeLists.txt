@@ -1,103 +1,84 @@
-cmake_minimum_required(VERSION 3.22.1 FATAL_ERROR)
-project(juce_audio_rn_native LANGUAGES CXX C)
+cmake_minimum_required(VERSION 3.22.1)
+project(juce_audio_rn_native LANGUAGES C CXX)
 
-if(WIN32)
-    set(CMAKE_GENERATOR "Visual Studio 17 2022" CACHE STRING "CMake generator" FORCE)
-    set(CMAKE_GENERATOR_PLATFORM "x64" CACHE STRING "CMake generator platform" FORCE)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---- Paths: adjust only if your tree is different ----
+set(JUCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/JUCE)
+set(OBOE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/oboe)
+
+if(NOT EXISTS "${JUCE_DIR}/modules/juce_core/juce_core.cpp")
+    message(FATAL_ERROR "JUCE not found at ${JUCE_DIR} (expected JUCE/modules/*)")
+endif()
+if(NOT EXISTS "${OBOE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "Oboe not found at ${OBOE_DIR} (expected oboe/CMakeLists.txt)")
 endif()
 
-set(JUCE_PATH "${CMAKE_SOURCE_DIR}/JUCE_Projects/JuceAudioEngine/JUCE_Library")
+# ---- Oboe (I/O) ----
+add_subdirectory(${OBOE_DIR} oboe_build)
 
-if(EXISTS ${JUCE_PATH})
-    message(STATUS "JUCE found at: ${JUCE_PATH}")
-    
-    if(WIN32)
-        set(JUCE_BUILD_EXAMPLES OFF CACHE BOOL "Don't build JUCE examples")
-        set(JUCE_BUILD_EXTRAS OFF CACHE BOOL "Don't build JUCE extras") 
-        set(JUCE_ENABLE_MODULE_SOURCE_GROUPS OFF CACHE BOOL "Disable module groups")
-        set(JUCE_TOOL_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/juce_tools" CACHE PATH "JUCE tools directory")
-    else()
-        set(JUCE_BUILD_EXAMPLES OFF CACHE BOOL "Don't build JUCE examples")
-        set(JUCE_BUILD_EXTRAS OFF CACHE BOOL "Don't build JUCE extras")
-        set(JUCE_ENABLE_MODULE_SOURCE_GROUPS OFF CACHE BOOL "Disable module groups")
-    endif()
-    
-    add_subdirectory(${JUCE_PATH} JUCE_build)
-    set(JUCE_AVAILABLE TRUE)
-else()
-    message(WARNING "JUCE not found at: ${JUCE_PATH}")
-    set(JUCE_AVAILABLE FALSE)
-endif()
-
+# ---- Native library ----
 add_library(juce_audio_rn_native SHARED
     JuceAudioJNI.cpp
 )
 
-if(JUCE_AVAILABLE)
-    target_link_libraries(juce_audio_rn_native PRIVATE
-        juce::juce_core
-        juce::juce_events
-    )
-    
-    target_compile_definitions(juce_audio_rn_native PRIVATE
-        JUCE_WEB_BROWSER=0
-        JUCE_USE_CURL=0
-        JUCE_APPLICATION_NAME_STRING="JuceAudioEngine"
-        JUCE_APPLICATION_VERSION_STRING="1.0.0"
-        JUCE_STANDALONE_APPLICATION=1
-        JUCE_HEADLESS_PLUGIN_CLIENT=1
-        
-        JUCE_USE_ANDROID_OPENSLES=0
-        JUCE_USE_ANDROID_OBOE=1
-        JUCE_ANDROID=1
-        
-        JUCE_ALSA_MIDI_ENABLED=0
-        JUCE_USE_ANDROID_MIDI_API=0
-        JUCE_MIDI_ENABLED=0
-        
-        JUCE_ANDROID_ACTIVITY_CLASSPATH=""
-        JUCE_DISABLE_JUCE_VERSION_PRINTING=1
-        
-        $<$<PLATFORM_ID:Windows>:JUCE_USE_WIN32_THREADS=1>
-        $<$<PLATFORM_ID:Windows>:NOMINMAX=1>
-        
-        HAS_JUCE=1
-    )
-else()
-    target_compile_definitions(juce_audio_rn_native PRIVATE
-        HAS_JUCE=0
-    )
-endif()
-
-if(WIN32 AND MSVC)
-    target_compile_options(juce_audio_rn_native PRIVATE
-        /utf-8  # Fix character encoding issues
-        /permissive-  # Disable non-conforming code
-    )
-endif()
-
-if(WIN32 AND MSVC)
-    target_compile_options(juce_audio_rn_native PRIVATE
-        /utf-8  # Fix character encoding issues
-        /permissive-  # Disable non-conforming code
-        /EHsc  # Exception handling
-        /GR  # RTTI enabled
-    )
-else()
-    target_compile_options(juce_audio_rn_native PRIVATE
-        -frtti
-        -fexceptions
-        -fvisibility=hidden
-    )
-endif()
-
-set_target_properties(juce_audio_rn_native PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED ON
-    ANDROID_STL c++_shared
+# JUCE modules (core/basics/formats/dsp)
+target_sources(juce_audio_rn_native PRIVATE
+    ${JUCE_DIR}/modules/juce_core/juce_core.cpp
+    ${JUCE_DIR}/modules/juce_audio_basics/juce_audio_basics.cpp
+    ${JUCE_DIR}/modules/juce_audio_formats/juce_audio_formats.cpp
+    ${JUCE_DIR}/modules/juce_dsp/juce_dsp.cpp
 )
 
+# Headers
+target_include_directories(juce_audio_rn_native
+    PRIVATE
+        ${JUCE_DIR}/modules
+)
+
+# NDK cpu-features (header path + source or lib)
+if(DEFINED ANDROID_NDK)
+    # 1) Header include path so <cpu-features.h> resolves
+    if(EXISTS "${ANDROID_NDK}/sources/android/cpufeatures")
+        target_include_directories(juce_audio_rn_native PRIVATE
+            ${ANDROID_NDK}/sources/android/cpufeatures
+        )
+    endif()
+
+    # 2) Some NDKs don’t ship a separate lib; compile the source directly if present
+    if(EXISTS "${ANDROID_NDK}/sources/android/cpufeatures/cpu-features.c")
+        target_sources(juce_audio_rn_native PRIVATE
+            ${ANDROID_NDK}/sources/android/cpufeatures/cpu-features.c
+        )
+    endif()
+endif()
+
+# Compile defs: headless + module markers
+target_compile_definitions(juce_audio_rn_native PRIVATE
+    JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1
+    JUCE_ANDROID=1
+    JUCE_STANDALONE_APPLICATION=0
+    JUCE_DSP_MODULE_AVAILABLE=1
+    JUCE_MODULE_AVAILABLE_juce_core=1
+    JUCE_MODULE_AVAILABLE_juce_audio_basics=1
+    JUCE_MODULE_AVAILABLE_juce_audio_formats=1
+    JUCE_MODULE_AVAILABLE_juce_dsp=1
+)
+
+# System libs
+find_library(log-lib log)
+find_library(android-lib android)
+find_library(opensles-lib OpenSLES)
+find_library(cpufeatures-lib cpufeatures) # if NDK still exposes this lib
+
+set(_libs ${log-lib} ${android-lib} ${opensles-lib})
+if(cpufeatures-lib)
+    list(APPEND _libs ${cpufeatures-lib})
+endif()
+
+# ---- Link ----
 target_link_libraries(juce_audio_rn_native PRIVATE
-    log
-    android
+    oboe
+    ${_libs}
 )

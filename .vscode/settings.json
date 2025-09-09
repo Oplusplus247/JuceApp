@@ -1,4 +1,17 @@
 {
     "java.configuration.updateBuildConfiguration": "interactive",
-    "java.compile.nullAnalysis.mode": "automatic"
+    "java.compile.nullAnalysis.mode": "automatic",
+    "files.associations": {
+        "*.mm": "cpp",
+        "array": "cpp",
+        "memory": "cpp",
+        "format": "cpp",
+        "future": "cpp",
+        "istream": "cpp",
+        "functional": "cpp",
+        "tuple": "cpp",
+        "utility": "cpp",
+        "variant": "cpp",
+        "string": "cpp"
+    }
 }

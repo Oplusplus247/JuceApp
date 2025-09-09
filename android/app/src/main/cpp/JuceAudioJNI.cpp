@@ -1,424 +1,387 @@
+// Keep JUCE headless (no JUCEApplicationBase)
+#define JUCE_APPLICATION_BASE 0
+#define JUCE_MODULE_AVAILABLE_juce_core 1
+#define JUCE_MODULE_AVAILABLE_juce_audio_basics 1
+#define JUCE_MODULE_AVAILABLE_juce_audio_formats 1
+#define JUCE_MODULE_AVAILABLE_juce_dsp 1
+
 #include <jni.h>
 #include <android/log.h>
 #include <string>
 #include <memory>
 #include <atomic>
 #include <cmath>
+#include <cstring>
+#include <mutex>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define TAG "JuceAudioJNI"
-#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define ALOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
+#ifndef HAS_JUCE
+#define HAS_JUCE 1
+#endif
 
 #if HAS_JUCE
-#include <juce_core/juce_core.h>
-#include <juce_audio_basics/juce_audio_basics.h>
-#include <juce_events/juce_events.h>
+  #include <juce_core/juce_core.h>
+  #include <juce_audio_basics/juce_audio_basics.h>
+  #include <juce_audio_formats/juce_audio_formats.h>
+  #include <juce_dsp/juce_dsp.h>
+  using namespace juce;
 
-class SimpleToneGenerator {
+  // Provide expected globals for some JUCE builds
+  namespace juce {
+    const char* juce_compilationDate = __DATE__;
+    const char* juce_compilationTime = __TIME__;
+  }
+#endif
+
+// Oboe for Android audio I/O
+#include <oboe/Oboe.h>
+
+// =================== Ring Buffer for Audio ===================
+template<typename T>
+class RingBuffer {
 public:
-    SimpleToneGenerator() 
-        : frequency(440.0f)
-        , volume(0.1f)
-        , isPlaying(false)
-    {
-        ALOGI("🎵 SimpleToneGenerator created");
+    RingBuffer(size_t capacity) : buffer(capacity), capacity_(capacity), readPos(0), writePos(0) {}
+    
+    bool write(const T* data, size_t count) {
+        if (getAvailableWrite() < count) {
+            return false; // Buffer full
+        }
+        for (size_t i = 0; i < count; ++i) {
+            buffer[writePos] = data[i];
+            writePos = (writePos + 1) % capacity_;
+        }
+        return true;
     }
     
-    void startTone() {
-        isPlaying.store(true);
-        ALOGI("🎵 Tone started: %.1f Hz", frequency.load());
+    bool read(T* data, size_t count) {
+        if (getAvailableRead() < count) {
+            return false; // Not enough data
+        }
+        for (size_t i = 0; i < count; ++i) {
+            data[i] = buffer[readPos];
+            readPos = (readPos + 1) % capacity_;
+        }
+        return true;
     }
     
-    void stopTone() {
-        isPlaying.store(false);
-        ALOGI("🎵 Tone stopped");
+    size_t getAvailableRead() const {
+        return (writePos >= readPos) ? (writePos - readPos) : (capacity_ - readPos + writePos);
     }
     
-    void setFrequency(float freq) {
-        frequency.store(freq);
-        ALOGI("🎵 Frequency set to: %.1f Hz", freq);
+    size_t getAvailableWrite() const {
+        return capacity_ - getAvailableRead() - 1;
     }
     
-    void setVolume(float vol) {
-        vol = std::max(0.0f, std::min(1.0f, vol));
-        volume.store(vol);
-        ALOGI("🎵 Volume set to: %.2f", vol);
-    }
-    
-    bool getIsPlaying() const {
-        return isPlaying.load();
-    }
-    
-    float getFrequency() const {
-        return frequency.load();
-    }
-    
-    float getVolume() const {
-        return volume.load();
+    void clear() {
+        readPos = 0;
+        writePos = 0;
     }
 
 private:
-    std::atomic<float> frequency;
-    std::atomic<float> volume;
-    std::atomic<bool> isPlaying;
+    std::vector<T> buffer;
+    size_t capacity_;
+    std::atomic<size_t> readPos;
+    std::atomic<size_t> writePos;
 };
 
-class RealJuceAudioEngine {
-    public:
-        RealJuceAudioEngine() : initialized(false) {
-            ALOGI("🎵 Real JUCE Audio Engine created (minimal version)");
-            toneGenerator = std::make_unique<SimpleToneGenerator>();
+// =================== Improved Oboe Audio Engine ===================
+class OboeEngine : public oboe::AudioStreamCallback {
+public:
+    OboeEngine()
+        : playing(false),
+          sampleRateHint(48000.0),
+          juceEnabled(true),
+          outputCallbackCount(0),
+          inputCallbackCount(0),
+          ringBuffer(48000) // 1 second buffer at 48kHz
+    {
+        ALOGI("OboeEngine created - CLEAR EFFECTS VERSION");
+        
+#if HAS_JUCE
+        // Initialize JUCE DSP components
+        spec.sampleRate = sampleRateHint;
+        spec.maximumBlockSize = 512;
+        spec.numChannels = 1;
+        
+        gain.prepare(spec);
+        gain.setGainLinear(1.0f); // Unity gain
+
+        // More pronounced effects
+        chorus.prepare(spec);
+        chorus.setRate(2.5f);           // Faster modulation
+        chorus.setDepth(0.8f);          // Deeper effect
+        chorus.setCentreDelay(10.0f);   // More delay
+        chorus.setFeedback(0.3f);       // More feedback
+        chorus.setMix(0.5f);            // 50% wet/dry mix
+
+        // Add a phaser for more dramatic effect
+        phaser.prepare(spec);
+        phaser.setRate(1.2f);
+        phaser.setDepth(0.9f);
+        phaser.setCentreFrequency(800.0f);
+        phaser.setFeedback(0.7f);
+        phaser.setMix(0.6f);
+
+        ALOGI("JUCE DSP initialized with CLEAR effects (Chorus + Phaser)");
+#endif
+    }
+
+    bool start() {
+        if (playing.load()) {
+            ALOGI("Already playing, returning true");
+            return true;
         }
+
+        ALOGI("Starting audio engine with CLEAR effects...");
+        ringBuffer.clear();
+
+        // === INPUT STREAM (Microphone) ===
+        oboe::AudioStreamBuilder inputBuilder;
+        inputBuilder.setDirection(oboe::Direction::Input);
+        inputBuilder.setFormat(oboe::AudioFormat::Float);
+        inputBuilder.setChannelCount(1);
+        inputBuilder.setSharingMode(oboe::SharingMode::Shared);
+        inputBuilder.setPerformanceMode(oboe::PerformanceMode::LowLatency);
+        inputBuilder.setSampleRate(static_cast<int32_t>(sampleRateHint));
+        inputBuilder.setCallback(this);
+        inputBuilder.setFramesPerCallback(256);
         
-        ~RealJuceAudioEngine() {
-            shutdown();
-        }
-        
-        bool initialize() {
-            try {
-                ALOGI("🎵 Initializing Real JUCE (minimal mode - no AudioDeviceManager)...");
-                
-                initialized = true;
-                
-                ALOGI("✅ JUCE minimal initialization successful!");
-                ALOGI("✅ Version: %s", juce::SystemStats::getJUCEVersion().toRawUTF8());
-                ALOGI("✅ Tone generator ready (no real audio output yet)");
-                
-                return true;
-                
-            } catch (const std::exception& e) {
-                ALOGE("Exception during JUCE initialization: %s", e.what());
-                return false;
-            }
-        }
-        
-        void shutdown() {
-            if (initialized) {
-                ALOGI("🎵 Shutting down Real JUCE Audio Engine...");
-                
-                if (toneGenerator) {
-                    toneGenerator->stopTone();
-                }
-                
-                initialized = false;
-                ALOGI("Real JUCE Audio Engine shut down");
-            }
-        }
-        
-        bool isInitialized() const { return initialized; }
-        
-        std::string getJuceVersion() const {
-            return "Real JUCE " + juce::SystemStats::getJUCEVersion().toStdString() + " (Minimal Mode)";
-        }
-        
-        double getCurrentSampleRate() const { return 44100.0; }
-        std::string getCurrentAudioDeviceName() const { return "Minimal JUCE Device (No Real Audio)"; }
-        int getOutputChannels() const { return 2; }
-        int getBufferSize() const { return 256; }
-        
-        void startTone() {
-            if (toneGenerator && initialized) {
-                toneGenerator->startTone();
-            }
-        }
-        
-        void stopTone() {
-            if (toneGenerator && initialized) {
-                toneGenerator->stopTone();
-            }
-        }
-        
-        void setToneFrequency(float frequency) {
-            if (toneGenerator) {
-                toneGenerator->setFrequency(frequency);
-            }
-        }
-        
-        void setToneVolume(float volume) {
-            if (toneGenerator) {
-                toneGenerator->setVolume(volume);
-            }
-        }
-        
-        bool isTonePlaying() const {
-            if (toneGenerator) {
-                return toneGenerator->getIsPlaying();
-            }
+        oboe::Result result = inputBuilder.openStream(inputStream);
+        if (result != oboe::Result::OK) {
+            ALOGE("Failed to open INPUT stream. Error: %s", oboe::convertToText(result));
             return false;
         }
         
-        float getToneFrequency() const {
-            if (toneGenerator) {
-                return toneGenerator->getFrequency();
-            }
-            return 0.0f;
+        ALOGI("Input stream opened - SR: %d, Buffer: %d", 
+              inputStream->getSampleRate(), inputStream->getBufferSizeInFrames());
+
+        // === OUTPUT STREAM (Speaker) ===
+        oboe::AudioStreamBuilder outputBuilder;
+        outputBuilder.setDirection(oboe::Direction::Output);
+        outputBuilder.setFormat(oboe::AudioFormat::Float);
+        outputBuilder.setChannelCount(1);
+        outputBuilder.setSharingMode(oboe::SharingMode::Shared);
+        outputBuilder.setPerformanceMode(oboe::PerformanceMode::LowLatency);
+        outputBuilder.setSampleRate(inputStream->getSampleRate());
+        outputBuilder.setCallback(this);
+        outputBuilder.setFramesPerCallback(256);
+        
+        result = outputBuilder.openStream(outputStream);
+        if (result != oboe::Result::OK) {
+            ALOGE("Failed to open OUTPUT stream. Error: %s", oboe::convertToText(result));
+            inputStream->close();
+            inputStream.reset();
+            return false;
         }
         
-        float getToneVolume() const {
-            if (toneGenerator) {
-                return toneGenerator->getVolume();
-            }
-            return 0.0f;
-        }
+        ALOGI("Output stream opened - SR: %d, Buffer: %d", 
+              outputStream->getSampleRate(), outputStream->getBufferSizeInFrames());
 
-    private:
-        bool initialized;
-        std::unique_ptr<SimpleToneGenerator> toneGenerator;
-    };
-
-    static std::unique_ptr<RealJuceAudioEngine> realJuceEngine;
-
-    #else
-    class BasicAudioEngine {
-    public:
-        bool initialize() { 
-            ALOGI("Basic Audio Engine initialized (no JUCE)");
-            return true; 
-        }
-        void shutdown() { 
-            ALOGI("Basic Audio Engine shut down");
-        }
-        bool isInitialized() const { return true; }
-        std::string getJuceVersion() const { return "No JUCE (Basic Engine)"; }
-        double getCurrentSampleRate() const { return 48000.0; }
-        std::string getCurrentAudioDeviceName() const { return "Basic Audio Device"; }
-        int getOutputChannels() const { return 2; }
-        int getBufferSize() const { return 256; }
+        // Update JUCE DSP with actual sample rate
+        double actualSampleRate = inputStream->getSampleRate();
         
-        void startTone() { ALOGI("Basic: Tone start (no audio)"); }
-        void stopTone() { ALOGI("Basic: Tone stop (no audio)"); }
-        void setToneFrequency(float freq) { ALOGI("Basic: Set frequency %.1f Hz (no audio)", freq); }
-        void setToneVolume(float vol) { ALOGI("Basic: Set volume %.2f (no audio)", vol); }
-        bool isTonePlaying() const { return false; }
-        float getToneFrequency() const { return 440.0f; }
-        float getToneVolume() const { return 0.1f; }
-    };
+#if HAS_JUCE
+        spec.sampleRate = actualSampleRate;
+        gain.prepare(spec);
+        gain.setGainLinear(1.0f);
 
-    static std::unique_ptr<BasicAudioEngine> basicEngine;
-    #endif
-
-    extern "C" {
-
-    JNIEXPORT jstring JNICALL
-    Java_com_juceaudioapp_AudioModule_stringFromJNI(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        std::string message = "Hello from Real JUCE JNI! (Minimal Mode)";
-    #else
-        std::string message = "Hello from Basic Audio JNI (No JUCE)";
-    #endif
-        ALOGI("%s", message.c_str());
-        return env->NewStringUTF(message.c_str());
-    }
-
-    JNIEXPORT jboolean JNICALL
-    Java_com_juceaudioapp_AudioModule_initializeJuceAudio(JNIEnv* env, jobject) {
-        try {
-            ALOGI("🎵 JNI: Initialize audio called");
-            
-    #if HAS_JUCE
-            if (!realJuceEngine) {
-                realJuceEngine = std::make_unique<RealJuceAudioEngine>();
-            }
-            bool success = realJuceEngine->initialize();
-    #else
-            if (!basicEngine) {
-                basicEngine = std::make_unique<BasicAudioEngine>();
-            }
-            bool success = basicEngine->initialize();
-    #endif
-            
-            ALOGI("🎵 Audio initialization result: %s", success ? "SUCCESS" : "FAILED");
-            return success ? JNI_TRUE : JNI_FALSE;
-            
-        } catch (const std::exception& e) {
-            ALOGE("Exception in audio initialization: %s", e.what());
-            return JNI_FALSE;
-        }
-    }
-
-    JNIEXPORT void JNICALL
-    Java_com_juceaudioapp_AudioModule_shutdownJuceAudio(JNIEnv* env, jobject) {
-        ALOGI("🎵 JNI: Shutdown audio called");
+        chorus.prepare(spec);
+        phaser.prepare(spec);
         
-    #if HAS_JUCE
-        if (realJuceEngine) {
-            realJuceEngine->shutdown();
-            realJuceEngine.reset();
+        ALOGI("JUCE DSP updated for SR: %.0f", actualSampleRate);
+#endif
+
+        // Start streams
+        result = inputStream->requestStart();
+        if (result != oboe::Result::OK) {
+            ALOGE("Failed to start INPUT stream");
+            return false;
         }
-    #else
-        if (basicEngine) {
-            basicEngine->shutdown();
-            basicEngine.reset();
+
+        result = outputStream->requestStart();
+        if (result != oboe::Result::OK) {
+            ALOGE("Failed to start OUTPUT stream");
+            inputStream->stop();
+            inputStream->close();
+            inputStream.reset();
+            return false;
         }
-    #endif
+
+        playing.store(true);
+        ALOGI("Audio engine started successfully - CLEAR EFFECT MODE");
+        return true;
     }
 
-    JNIEXPORT jstring JNICALL
-    Java_com_juceaudioapp_AudioModule_getJuceVersion(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine) {
-            std::string version = realJuceEngine->getJuceVersion();
-            return env->NewStringUTF(version.c_str());
+    void stop() {
+        ALOGI("Stopping audio engine...");
+        playing.store(false);
+        
+        if (inputStream) {
+            inputStream->stop();
+            inputStream->close();
+            inputStream.reset();
         }
-    #else
-        if (basicEngine) {
-            std::string version = basicEngine->getJuceVersion();
-            return env->NewStringUTF(version.c_str());
+        
+        if (outputStream) {
+            outputStream->stop();
+            outputStream->close();
+            outputStream.reset();
         }
-    #endif
-        return env->NewStringUTF("Audio Engine Not Initialized");
     }
 
-    JNIEXPORT jdouble JNICALL
-    Java_com_juceaudioapp_AudioModule_getCurrentSampleRate(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            return realJuceEngine->getCurrentSampleRate();
+    double getSampleRate() const {
+        if (outputStream) {
+            return outputStream->getSampleRate();
         }
-    #else
-        if (basicEngine) {
-            return basicEngine->getCurrentSampleRate();
-        }
-    #endif
-        return 0.0;
+        return sampleRateHint;
     }
 
-    JNIEXPORT jstring JNICALL
-    Java_com_juceaudioapp_AudioModule_getCurrentAudioDeviceName(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            std::string deviceName = realJuceEngine->getCurrentAudioDeviceName();
-            return env->NewStringUTF(deviceName.c_str());
-        }
-    #else
-        if (basicEngine) {
-            std::string deviceName = basicEngine->getCurrentAudioDeviceName();
-            return env->NewStringUTF(deviceName.c_str());
-        }
-    #endif
-        return env->NewStringUTF("No Device");
+    void setJuceEnabled(bool enabled) {
+        juceEnabled.store(enabled);
+        ALOGI("JUCE effects %s - YOU SHOULD HEAR A CLEAR DIFFERENCE NOW!", enabled ? "ENABLED" : "DISABLED");
     }
 
-    JNIEXPORT jint JNICALL
-    Java_com_juceaudioapp_AudioModule_getOutputChannels(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            return realJuceEngine->getOutputChannels();
+    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream, void* audioData, int32_t numFrames) override {
+        if (stream->getDirection() == oboe::Direction::Input) {
+            inputCallbackCount++;
+            float* inputData = static_cast<float*>(audioData);
+            if (!ringBuffer.write(inputData, static_cast<size_t>(numFrames))) {
+                if (inputCallbackCount % 500 == 0) ALOGD("Ring buffer full, dropping input frames");
+            }
+            return oboe::DataCallbackResult::Continue;
         }
-    #else
-        if (basicEngine) {
-            return basicEngine->getOutputChannels();
+        
+        if (stream->getDirection() == oboe::Direction::Output) {
+            outputCallbackCount++;
+            float* outputData = static_cast<float*>(audioData);
+            
+            bool hasData = ringBuffer.read(outputData, static_cast<size_t>(numFrames));
+            if (hasData) {
+#if HAS_JUCE
+                // Always build block from channel array
+                float* channels[] = { outputData };
+                juce::dsp::AudioBlock<float> block (channels, 1, (size_t) numFrames);
+
+                // Create the context here so it's available in both branches
+                juce::dsp::ProcessContextReplacing<float> ctx(block);
+
+                if (juceEnabled.load()) {
+                    // APPLY CLEAR, AUDIBLE EFFECTS (no loudness normalization)
+                    // Process: Chorus -> Phaser (both clearly audible)
+                    chorus.process(ctx);
+                    phaser.process(ctx);
+                    
+                    // Slight volume boost to make effect more noticeable
+                    gain.setGainLinear(3.0f); // 20% volume boost when effects are on
+                    gain.process(ctx);
+
+                    if (outputCallbackCount % 500 == 0) {
+                        ALOGI("EFFECTS ON: Chorus + Phaser active (volume +20%%)");
+                    }
+                } else {
+                    // Effects bypassed - clean pass-through at unity gain
+                    gain.setGainLinear(3.0f);
+                    gain.process(ctx);
+                    
+                    if (outputCallbackCount % 500 == 0) {
+                        ALOGI("EFFECTS OFF: Clean pass-through");
+                    }
+                }
+#endif
+
+                if (outputCallbackCount % 1000 == 0) {
+                    float maxLevel = 0.0f;
+                    for (int i = 0; i < numFrames; ++i) maxLevel = std::max(maxLevel, std::abs(outputData[i]));
+                    ALOGI("OUTPUT #%d: maxLevel=%.4f, JUCE=%s", 
+                          outputCallbackCount, maxLevel, juceEnabled.load() ? "ON" : "OFF");
+                }
+            } else {
+                std::memset(outputData, 0, static_cast<size_t>(numFrames) * sizeof(float));
+            }
+            return oboe::DataCallbackResult::Continue;
         }
-    #endif
-        return 0;
+        return oboe::DataCallbackResult::Continue;
     }
 
-    JNIEXPORT jint JNICALL
-    Java_com_juceaudioapp_AudioModule_getBufferSize(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            return realJuceEngine->getBufferSize();
-        }
-    #else
-        if (basicEngine) {
-            return basicEngine->getBufferSize();
-        }
-    #endif
-        return 0;
+    void onErrorBeforeClose(oboe::AudioStream* stream, oboe::Result error) override {
+        ALOGE("Audio stream error: %s", oboe::convertToText(error));
     }
 
-    JNIEXPORT void JNICALL
-    Java_com_juceaudioapp_AudioModule_startTone(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            realJuceEngine->startTone();
-        }
-    #else
-        if (basicEngine) {
-            basicEngine->startTone();
-        }
-    #endif
+    void onErrorAfterClose(oboe::AudioStream* stream, oboe::Result error) override {
+        ALOGE("Audio stream closed with error: %s", oboe::convertToText(error));
+        playing.store(false);
     }
 
-    JNIEXPORT void JNICALL
-    Java_com_juceaudioapp_AudioModule_stopTone(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            realJuceEngine->stopTone();
-        }
-    #else
-        if (basicEngine) {
-            basicEngine->stopTone();
-        }
-    #endif
-    }
+private:
+    std::shared_ptr<oboe::AudioStream> inputStream;
+    std::shared_ptr<oboe::AudioStream> outputStream;
+    RingBuffer<float> ringBuffer;
+    std::atomic<bool> playing;
+    std::atomic<bool> juceEnabled;
+    double sampleRateHint;
+    int outputCallbackCount;
+    int inputCallbackCount;
 
-    JNIEXPORT void JNICALL
-    Java_com_juceaudioapp_AudioModule_setToneFrequency(JNIEnv* env, jobject, jfloat frequency) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            realJuceEngine->setToneFrequency(frequency);
-        }
-    #else
-        if (basicEngine) {
-            basicEngine->setToneFrequency(frequency);
-        }
-    #endif
-    }
+#if HAS_JUCE
+    juce::dsp::ProcessSpec spec;
+    juce::dsp::Gain<float> gain;
+    juce::dsp::Chorus<float> chorus;
+    juce::dsp::Phaser<float> phaser;
+#endif
+};
 
-    JNIEXPORT void JNICALL
-    Java_com_juceaudioapp_AudioModule_setToneVolume(JNIEnv* env, jobject, jfloat volume) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            realJuceEngine->setToneVolume(volume);
-        }
-    #else
-        if (basicEngine) {
-            basicEngine->setToneVolume(volume);
-        }
-    #endif
-    }
+// =============== Global Engine + JNI bridge ===============
+static std::unique_ptr<OboeEngine> gEngine;
 
-    JNIEXPORT jboolean JNICALL
-    Java_com_juceaudioapp_AudioModule_isTonePlaying(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            return realJuceEngine->isTonePlaying() ? JNI_TRUE : JNI_FALSE;
-        }
-    #else
-        if (basicEngine) {
-            return basicEngine->isTonePlaying() ? JNI_TRUE : JNI_FALSE;
-        }
-    #endif
-        return JNI_FALSE;
-    }
+extern "C" {
 
-    JNIEXPORT jfloat JNICALL
-    Java_com_juceaudioapp_AudioModule_getToneFrequency(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            return realJuceEngine->getToneFrequency();
-        }
-    #else
-        if (basicEngine) {
-            return basicEngine->getToneFrequency();
-        }
-    #endif
-        return 440.0f;
+JNIEXPORT jboolean JNICALL
+Java_com_juceaudioapp_AudioModule_nativeInitializeJuceAudio(JNIEnv*, jobject) {
+    ALOGI("=== INITIALIZING CLEAR EFFECTS AUDIO ===");
+    if (!gEngine) {
+        gEngine = std::make_unique<OboeEngine>();
     }
-
-    JNIEXPORT jfloat JNICALL
-    Java_com_juceaudioapp_AudioModule_getToneVolume(JNIEnv* env, jobject) {
-    #if HAS_JUCE
-        if (realJuceEngine && realJuceEngine->isInitialized()) {
-            return realJuceEngine->getToneVolume();
-        }
-    #else
-        if (basicEngine) {
-            return basicEngine->getToneVolume();
-        }
-    #endif
-        return 0.1f;
-    }
-
+    bool result = gEngine->start();
+    ALOGI("=== INIT RESULT: %s ===", result ? "SUCCESS" : "FAILED");
+    return result ? JNI_TRUE : JNI_FALSE;
 }
+
+JNIEXPORT void JNICALL
+Java_com_juceaudioapp_AudioModule_nativeShutdownJuceAudio(JNIEnv*, jobject) {
+    ALOGI("=== SHUTTING DOWN AUDIO ===");
+    if (gEngine) {
+        gEngine->stop();
+        gEngine.reset();
+    }
+    ALOGI("=== SHUTDOWN COMPLETE ===");
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_juceaudioapp_AudioModule_nativeGetJuceVersion(JNIEnv* env, jobject) {
+#if HAS_JUCE
+    return env->NewStringUTF("JUCE with CLEAR Chorus+Phaser effects");
+#else
+    return env->NewStringUTF("JUCE disabled");
+#endif
+}
+
+JNIEXPORT jdouble JNICALL
+Java_com_juceaudioapp_AudioModule_nativeGetCurrentSampleRate(JNIEnv*, jobject) {
+    return gEngine ? gEngine->getSampleRate() : 0.0;
+}
+
+JNIEXPORT void JNICALL
+Java_com_juceaudioapp_AudioModule_nativeSetJuceEnabled(JNIEnv*, jobject, jboolean enabled) {
+    ALOGI("=== SETTING JUCE ENABLED: %s ===", enabled == JNI_TRUE ? "TRUE" : "FALSE");
+    if (gEngine) gEngine->setJuceEnabled(enabled == JNI_TRUE);
+}
+
+} // extern "C"
